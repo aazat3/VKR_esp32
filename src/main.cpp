@@ -757,7 +757,7 @@ void loop() {
         // webSocket.setReconnectInterval(5000);
         if (!webSocket.isConnected()) {
             webSocket.begin(websocket_server, websocket_port);
-            Serial.println("🎙 Подключение к WebSocket серверу...");
+            Serial.println("🎙 Подключение к WebSocket серверу..");
         }
         i2s_start(I2S_NUM_0);
         Serial.println("🎙 Начало записи...");
