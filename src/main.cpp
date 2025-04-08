@@ -525,10 +525,13 @@
 #define I2S_WS  15   // L/R Word Select
 #define I2S_SD  32   // Serial Data
 #define I2S_SCK 14   // Serial Clock
-#define SAMPLE_RATE 16000
-#define BUFFER_SIZE 256  // Размер буфера для передачи
-
 #define BUTTON_PIN 33       // Пин кнопки
+
+#define SAMPLE_RATE 16000
+#define BUFFER_SIZE 600  // Размер буфера для передачи
+#define VOX_THRESHOLD 200    // Порог громкости (подбирается экспериментально)
+#define VOX_SILENCE_TIME 500  // Время (мс), через которое считаем, что говорящий замолчал
+
 
 const char* ssid = "POCO X3 NFC";
 const char* password = "12345678";
@@ -539,7 +542,10 @@ const char* websocket_path = "/";
 WebSocketsClient webSocket;
 QueueHandle_t audioQueue;
 
-
+unsigned long lastVoiceTime = 0;
+bool isSpeaking = false;
+bool allowReconnect = false;
+volatile bool buttonState = HIGH;
 // Настройка I2S
 void setupI2S() {
     i2s_config_t i2s_config = {
@@ -549,7 +555,7 @@ void setupI2S() {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 100,
+        .dma_buf_count = 10,
         .dma_buf_len = BUFFER_SIZE,
         .use_apll = false
     };
@@ -577,52 +583,126 @@ void setupWiFi() {
 
 // WebSocket
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-    if (type == WStype_CONNECTED) {
-        Serial.println("Connected to WebSocket server");
-    } else if (type == WStype_DISCONNECTED) {
-        Serial.println("Disconnected from WebSocket server");
+    switch (type) {
+        case WStype_CONNECTED:
+            Serial.println("✅ Connected to WebSocket server");
+            break;
+        case WStype_DISCONNECTED:
+            Serial.println("❌ Disconnected");
+            // if (!allowReconnect) {
+            //     webSocket.setReconnectInterval(0);  // Отключаем авто-переподключение
+            // }
+            break;
+        case WStype_TEXT:
+            Serial.printf("📨 Message: %s\n", payload);
+            break;
+        case WStype_BIN:
+            Serial.printf("📨 Binary data received (%d bytes)\n", length);
+            break;
     }
 }
 
-void setupWebSocket() {
-    webSocket.begin(websocket_server, websocket_port);
-    webSocket.onEvent(webSocketEvent);
+// void setupWebSocket() {
+//     webSocket.begin(websocket_server, websocket_port);
+//     webSocket.onEvent(webSocketEvent);
+// }
+
+bool detectSpeech(int16_t* samples, size_t sampleCount) {
+    int32_t totalAmplitude = 0;
+
+    for (size_t i = 0; i < sampleCount; i++) {
+        totalAmplitude += abs(samples[i]);
+    }
+
+    int32_t averageAmplitude = totalAmplitude / sampleCount;
+    bool isdetected = averageAmplitude > VOX_THRESHOLD;
+    if (isdetected){
+        // Serial.println("Speaking");
+    } else{
+        // Serial.println("Not speaking");
+    }
+    return isdetected;
 }
 
 void i2sTask(void* parameter) {
     int16_t samples[BUFFER_SIZE];
     size_t bytesRead;
+    bool lastButton = HIGH;
+    int8_t initDetect = 0;
 
     while (true) {
-        // if (isStreaming) {
-            i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
-            // if (bytesRead > 0) {
-                // Копируем в heap и отправляем в очередь
-                int16_t* copy = (int16_t*)malloc(bytesRead);
-                // if (copy) {
-                    memcpy(copy, samples, bytesRead);
-                    xQueueSend(audioQueue, &copy, portMAX_DELAY);
-                // }
-            // }
-        // } else {
-            // vTaskDelay(10);  // чтобы не грузить ядро, если не стримим
-        // }
+        i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
+        // if (lastButton == HIGH and buttonState == LOW){
+        //     lastButton = LOW;
+        //     while(initDetect < 5){
+        //         if (detectSpeech(samples, BUFFER_SIZE)){
+        //             initDetect++;
+        //         }
+        //     }
+        //     initDetect = 0;
+        //     lastVoiceTime = millis();
+        // } 
+        if (detectSpeech(samples, BUFFER_SIZE)) {
+            lastVoiceTime = millis();
+            isSpeaking = true;
+            Serial.println("Speaking");
+        } else if (millis() - lastVoiceTime > VOX_SILENCE_TIME) {
+            isSpeaking = false;
+            Serial.println("Not speaking");
+        }
+
+        if (isSpeaking) {
+            int16_t* copy = (int16_t*)malloc(bytesRead);
+            if (copy != NULL) {
+                memcpy(copy, samples, bytesRead);
+                xQueueSend(audioQueue, &copy, portMAX_DELAY);
+            } else {
+                Serial.println("❌ malloc failed");
+            }
+        }
+        lastButton = buttonState;
     }
 }
 
+// void i2sTask(void* parameter) {
+//     int16_t samples[BUFFER_SIZE];
+//     size_t bytesRead;
+
+//     while (true) {
+//             i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
+//             int16_t* copy = (int16_t*)malloc(bytesRead);
+//             if (copy != NULL) {
+//                 memcpy(copy, samples, bytesRead);
+//                 xQueueSend(audioQueue, &copy, portMAX_DELAY);
+//             } else {
+//                 Serial.println("❌ malloc failed");
+//             }
+//     }
+// }
+
 void websocketTask(void* parameter) {
     int16_t* receivedSamples;
-    const TickType_t xDelay = pdMS_TO_TICKS(15);
+    bool eofSent = false;
+
+    // const TickType_t xDelay = pdMS_TO_TICKS(1);
     while (true) {
-        // Блокируется, пока нет данных
         if (webSocket.isConnected()) {
-            xQueueReceive(audioQueue, &receivedSamples, portMAX_DELAY) == pdTRUE;
-            webSocket.sendBIN((uint8_t*)receivedSamples, BUFFER_SIZE * sizeof(int16_t));
-            free(receivedSamples);
-            
-            
-        } 
-        vTaskDelay(xDelay);
+            if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500)) == pdTRUE){
+                webSocket.sendBIN((uint8_t*)receivedSamples, BUFFER_SIZE * sizeof(int16_t));
+                free(receivedSamples);
+                eofSent = false;
+            } else {
+                if (buttonState == HIGH && !eofSent) {
+                    webSocket.sendTXT("{\"eof\" : 1}");
+                    allowReconnect = false;
+                    delay(1000);
+                    webSocket.disconnect();
+                    // webSocket.setReconnectInterval(0);
+                    Serial.println("🛑 Отключение от WebSocket сервера.");
+                } 
+            } 
+        // vTaskDelay(xDelay);
+        }
     }
 }
 
@@ -631,11 +711,12 @@ void setup() {
     Serial.begin(115200);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     setupWiFi();
+    webSocket.onEvent(webSocketEvent);
     setupI2S();
-    setupWebSocket();
+    // setupWebSocket();
 
     // Создаём очередь для аудиоданных
-    audioQueue = xQueueCreate(10, sizeof(int16_t*));
+    audioQueue = xQueueCreate(100, sizeof(int16_t*));
 
     // Запуск задачи для чтения с I2S (ядро 1)
     xTaskCreatePinnedToCore(
@@ -645,7 +726,7 @@ void setup() {
         NULL,                // аргумент (не используется)
         1,                   // приоритет
         NULL,                // хендл (не используется)
-        1                    // ядро (1 = APP)
+        0                    // ядро (1 = APP)
     );
 
     // Запуск задачи для отправки по WebSocket (ядро 0)
@@ -656,31 +737,42 @@ void setup() {
         NULL,                // аргумент (не используется)
         1,                   // приоритет
         NULL,                // хендл (не используется)
-        0                    // ядро (0 = PRO)
+        1                    // ядро (0 = PRO)
     );
+
+    Serial.println("setup выполнен");
 }
 
 // loop
 void loop() {
-    webSocket.loop();
-
-    // Проверка кнопки
     static bool lastButtonState = HIGH;
-    bool buttonState = digitalRead(BUTTON_PIN);
 
+    if (allowReconnect){
+        webSocket.loop();
+    }
+    // Проверка кнопки
+    buttonState = digitalRead(BUTTON_PIN);
     if (buttonState == LOW && lastButtonState == HIGH) {
-        // isStreaming = true;
+        allowReconnect = true;
+        // webSocket.setReconnectInterval(5000);
+        if (!webSocket.isConnected()) {
+            webSocket.begin(websocket_server, websocket_port);
+            Serial.println("🎙 Подключение к WebSocket серверу...");
+        }
         i2s_start(I2S_NUM_0);
         Serial.println("🎙 Начало записи...");
     } else if (buttonState == HIGH && lastButtonState == LOW) {
-        // isStreaming = false;
         i2s_stop(I2S_NUM_0);
         Serial.println("🛑 Остановлена запись.");
+        // if (webSocket.isConnected()) {
+        //     webSocket.sendTXT("{\"eof\" : 1}");
+        //     delay(1000);
+        //     webSocket.disconnect();
+        //     // webSocket.setReconnectInterval(0);
+        //     Serial.println("🛑 Отключение от WebSocket сервера.");
+        // }
     }
-
     lastButtonState = buttonState;
-
-    // delay(10);
 }
 
 
