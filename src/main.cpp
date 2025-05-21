@@ -2,9 +2,10 @@
 #include <WebSocketsClient.h>
 #include <driver/i2s.h>
 #include "HX711.h"
-#include <Wire.h>
+// #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "FontsRus/TimesNRCyr6.h"
 
 // INMP441 pin
 #define I2S_WS  15   // L/R Word Select
@@ -23,11 +24,12 @@ const int LOADCELL_SCK_PIN = 4;
 #define SAMPLE_RATE 16000
 #define BUFFER_SIZE 600  // Размер буфера для передачи
 #define VOX_THRESHOLD 40    // Порог громкости (подбирается экспериментально)
-#define VOX_SILENCE_TIME 500  // Время (мс), через которое считаем, что говорящий замолчал
+#define VOX_SILENCE_TIME 1000  // Время (мс), через которое считаем, что говорящий замолчал
 #define CALIBRATION_FACTOR 290.46 // Калибровка тензодатчика
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCALE_CHANGE_TIME 500 
 
 
 const char* ssid = "POCO X3 NFC";
@@ -45,26 +47,39 @@ unsigned long lastVoiceTime = 0;
 bool isSpeaking = false;
 bool allowReconnect = false;
 volatile bool buttonState = HIGH;
-volatile bool lastButtonStateFori2sTask = HIGH;
 int scaleReading;
-int sclaeLastReading;
+int scaleLastReading;
+int savedScaleReading = 0;
+unsigned long lastScaleTime = 0;
+volatile bool scaleChanged = false;
+String message = "";
+
+String deviceID = "";
+
 
 
 void displayWeight(int weight){
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(WHITE);
-    display.setCursor(0, 10);
+    display.setCursor(0, 50);
     // Display static text
-    display.println("Weight:");
+    display.println("Вес:");
     display.display();
-    display.setCursor(0, 30);
-    display.setTextSize(2);
+    display.setCursor(35, 50);
+    display.setTextSize(3);
     display.print(weight);
     display.print(" ");
     display.print("g");
     display.display();  
-  }
+
+    // Проверка, если второй аргумент не пустой
+    display.setTextSize(2);
+    display.setCursor(0, 14);  // Местоположение для второго текста
+    display.println(message);
+    display.display();
+}
+
 
 // Настройка I2S
 void setupI2S() {
@@ -96,9 +111,11 @@ void setupI2S() {
 void setupWiFi() {
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+        delay(100);
         Serial.print(".");
     }
+    deviceID = WiFi.macAddress();  // например, "24:6F:28:A3:B2:10"
+    deviceID.replace(":", "");     // сделать ID компактнее: "246F28A3B210"
     Serial.println("\nConnected to WiFi");
 }
 
@@ -111,24 +128,27 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
         case WStype_DISCONNECTED:
             Serial.println("❌ Disconnected");
+            allowReconnect = false;
             // if (!allowReconnect) {
             //     webSocket.setReconnectInterval(0);  // Отключаем авто-переподключение
             // }
             break;
         case WStype_TEXT:
-            // Serial.printf("📨 Message: %s\n", payload);
+            if (payload != nullptr && length > 0) {
+                // Создаем строку из полезной части payload (без мусора после \0)
+                message = String((const char*)payload).substring(0, length);
+                Serial.print("📨 Message: ");
+                Serial.println(message);
+                displayWeight(scaleReading);
+            } else {
+                Serial.println("📨 Empty or invalid message received");
+            }
             break;
         case WStype_BIN:
             // Serial.printf("📨 Binary data received (%d bytes)\n", length);
             break;
     }
 }
-
-
-// void setupWebSocket() {
-//     webSocket.begin(websocket_server, websocket_port);
-//     webSocket.onEvent(webSocketEvent);
-// }
 
 
 void setColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -140,18 +160,11 @@ void setColor(uint8_t r, uint8_t g, uint8_t b) {
 
 bool detectSpeech(int16_t* samples, size_t sampleCount) {
     int32_t totalAmplitude = 0;
-
     for (size_t i = 0; i < sampleCount; i++) {
         totalAmplitude += abs(samples[i]);
     }
-
     int32_t averageAmplitude = totalAmplitude / sampleCount;
     bool isdetected = averageAmplitude > VOX_THRESHOLD;
-    // if (isdetected){
-    //     Serial.println("Speaking");
-    // } else{
-    //     Serial.println("Not speaking");
-    // }
     return isdetected;
 }
 
@@ -159,35 +172,51 @@ bool detectSpeech(int16_t* samples, size_t sampleCount) {
 void i2sTask(void* parameter) {
     int16_t samples[BUFFER_SIZE];
     size_t bytesRead;
-    // bool lastButton = HIGH;
+
     int8_t initDetect = 0;
+    bool scaleActivating = false;
+    bool firstVoiceFlag = false;
 
     while (true) {
         i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
-        // if (millis() - lastVoiceTime > 2000){
-        //     lastButtonStateFori2sTask = HIGH;
-        // }
-        if (lastButtonStateFori2sTask == HIGH and buttonState == LOW){
-            lastButtonStateFori2sTask = LOW;
-            // for (int i = 0; i < 40; i++){
-            //     i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
-            // }
+        if (scaleChanged == true && scaleActivating == false){
+            scaleActivating = true;
+            // Не учитывать начальные шумы микрофона
             while(initDetect < 3){
                 i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
                 if (!detectSpeech(samples, BUFFER_SIZE)){
                     initDetect++;
                 }
             }
+            setColor(0,0,20);
             initDetect = 0;
             lastVoiceTime = millis();
         } 
         if (detectSpeech(samples, BUFFER_SIZE)) {
+            firstVoiceFlag = true;
             lastVoiceTime = millis();
             isSpeaking = true;
             Serial.println("Speaking");
         } else if (millis() - lastVoiceTime > VOX_SILENCE_TIME) {
             isSpeaking = false;
             Serial.println("Not speaking");
+            if (firstVoiceFlag){
+                firstVoiceFlag = false;
+                scaleActivating = false;
+                scaleChanged = false;
+                i2s_stop(I2S_NUM_0);
+                Serial.println("🛑 Остановлена запись.");
+                setColor(0,0,0);
+                continue;
+            }
+        } else if (abs(scaleReading) < 2){
+            firstVoiceFlag = false;
+                scaleActivating = false;
+                scaleChanged = false;
+                i2s_stop(I2S_NUM_0);
+                Serial.println("Весы пустые.");
+                setColor(0,0,0);
+                continue;
         }
 
         if (isSpeaking) {
@@ -210,7 +239,6 @@ void websocketTask(void* parameter) {
     int16_t* receivedSamples;
     bool eofSent = false;
 
-    // const TickType_t xDelay = pdMS_TO_TICKS(1);
     while (true) {
         if (webSocket.isConnected()) {
             if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500)) == pdTRUE){
@@ -218,16 +246,19 @@ void websocketTask(void* parameter) {
                 free(receivedSamples);
                 eofSent = false;
             } else {
-                if (buttonState == HIGH && !eofSent) {
+                if (scaleChanged == false && !eofSent) {
+
+                    String id = "{\"id\":\"" + deviceID + "\",\"weight\":" + String(savedScaleReading) + "}";
+                    webSocket.sendTXT(id);
                     webSocket.sendTXT("{\"eof\" : 1}");
-                    allowReconnect = false;
-                    delay(500);
-                    webSocket.disconnect();
+                    
+                    delay(1000);
+                    eofSent = true;
+                    // webSocket.disconnect();
                     // webSocket.setReconnectInterval(0);
                     Serial.println("🛑 Отключение от WebSocket сервера.");
                 } 
             } 
-        // vTaskDelay(xDelay);
         }
     }
 }
@@ -240,6 +271,7 @@ void setup() {
     pinMode(RED_PIN, OUTPUT);
     pinMode(GREEN_PIN, OUTPUT);
     pinMode(BLUE_PIN, OUTPUT);
+    setColor(20,0,0);
     setupWiFi();
     webSocket.onEvent(webSocketEvent);
     setupI2S();
@@ -248,6 +280,8 @@ void setup() {
         Serial.println(F("SSD1306 allocation failed"));
         for(;;);
     }
+
+    display.setFont(&TimesNRCyr6pt8b);
     display.clearDisplay();
     display.setTextColor(WHITE);
     
@@ -281,19 +315,48 @@ void setup() {
     );
 
     Serial.println("setup выполнен");
+    setColor(0,0,0);
 }
 
 
 void loop() {
     static bool lastButtonState = HIGH;
+    buttonState = digitalRead(BUTTON_PIN);
+    if (buttonState == LOW && lastButtonState == HIGH) {
+        Serial.print("tare...");
+        scale.tare();
+    }
 
     if (allowReconnect){
         webSocket.loop();
     }
 
-    buttonState = digitalRead(BUTTON_PIN);
-    if (buttonState == LOW && lastButtonState == HIGH) {
+    if (scale.wait_ready_timeout(200)) {
+        scaleReading = round(scale.get_units());
+        // убрать начальные шаги в граммах
+        if (abs(scaleReading) < 2){
+            scaleReading = 0;
+            display.ssd1306_command(SSD1306_DISPLAYOFF);
+        } else {
+            display.ssd1306_command(SSD1306_DISPLAYON);
+        }
+        if (abs(scaleReading - scaleLastReading) > 1){
+          displayWeight(scaleReading); 
+          lastScaleTime = millis();
+        }
+        if (scaleLastReading < 2){
+            savedScaleReading = 0;
+        }
+        scaleLastReading = scaleReading;
+      }
+      else {
+        Serial.println("HX711 not found.");
+      }
+
+    if (scaleLastReading > 1 && scaleLastReading - savedScaleReading > 2 && millis() - lastScaleTime > SCALE_CHANGE_TIME) {
+        savedScaleReading = scaleLastReading;
         allowReconnect = true;
+        scaleChanged = true;
         // webSocket.setReconnectInterval(5000);
         if (!webSocket.isConnected()) {
             webSocket.begin(websocket_server, websocket_port);
@@ -301,23 +364,6 @@ void loop() {
         }
         i2s_start(I2S_NUM_0);
         Serial.println("🎙 Начало записи...");
-        setColor(0,0,20);
-    } else if (buttonState == HIGH && lastButtonState == LOW) {
-        i2s_stop(I2S_NUM_0);
-        lastButtonStateFori2sTask = HIGH;
-        Serial.println("🛑 Остановлена запись.");
-        setColor(0,0,0);
-    }
+    } 
     lastButtonState = buttonState;
-
-    if (scale.wait_ready_timeout(200)) {
-        scaleReading = round(scale.get_units());
-        if (scaleReading != sclaeLastReading){
-          displayWeight(scaleReading); 
-        }
-        sclaeLastReading = scaleReading;
-      }
-      else {
-        Serial.println("HX711 not found.");
-      }
 }
