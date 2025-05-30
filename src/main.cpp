@@ -1,44 +1,40 @@
 #include <WiFi.h>
-#include "WiFiProv.h"
-#include "nvs_flash.h"
-#include "esp_wifi_types.h"
-#include <esp32-hal-bt.h>
-#include <esp_bt.h>
+#include <nvs_flash.h>
+#include <esp_wifi_types.h>
 #include <WebSocketsClient.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
 #include "HX711.h"
-// #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "FontsRus/TimesNRCyr6.h"
 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// INMP441 pin
-#define I2S_WS 15  // L/R Word Select
-#define I2S_SD 32  // Serial Data
-#define I2S_SCK 14 // Serial Clock
-// Button pin
-#define BUTTON_PIN 33 // Пин кнопки
-// HX711 pin
-const int LOADCELL_DOUT_PIN = 16;
-const int LOADCELL_SCK_PIN = 4;
-// RGB led pin
+// Конфигурация пинов
+#define I2S_WS 15
+#define I2S_SD 32
+#define I2S_SCK 14
+#define BUTTON_PIN 33
+#define LOADCELL_DOUT_PIN 16
+#define LOADCELL_SCK_PIN 4
 #define RED_PIN 25
 #define GREEN_PIN 26
 #define BLUE_PIN 27
 
 #define SAMPLE_RATE 16000
-#define BUFFER_SIZE 600           // Размер буфера для передачи
-#define VOX_THRESHOLD 40          // Порог громкости (подбирается экспериментально)
-#define VOX_SILENCE_TIME 1000     // Время (мс), через которое считаем, что говорящий замолчал
-#define CALIBRATION_FACTOR 290.46 // Калибровка тензодатчика
-#define SCREEN_WIDTH 128          // OLED display width, in pixels
-#define SCREEN_HEIGHT 64          // OLED display height, in pixels
-#define OLED_RESET -1             // Reset pin # (or -1 if sharing Arduino reset pin)
+#define BUFFER_SIZE 600
+#define VOX_THRESHOLD 40
+#define VOX_SILENCE_TIME 1000
+#define CALIBRATION_FACTOR 290.46
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
 #define SCALE_CHANGE_TIME 500
 
-// const char *ssid = "POCO X3 NFC";
-// const char *password = "12345678";
 const char *websocket_server = "aazatserver.ru";
 const uint16_t websocket_port = 5000;
 const char *websocket_path = "/";
@@ -48,6 +44,7 @@ QueueHandle_t audioQueue;
 HX711 scale;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Глобальные переменные
 unsigned long lastVoiceTime = 0;
 bool isSpeaking = false;
 bool allowReconnect = false;
@@ -59,13 +56,77 @@ int savedScaleReading = 0;
 unsigned long lastScaleTime = 0;
 volatile bool scaleChanged = false;
 String message = "";
-
 String deviceID = "";
 
-const char *pop = "abcd1234";          // Proof of possession - otherwise called a PIN - string provided by the device, entered by the user in the phone app
-const char *service_name = "PROV_123"; // Name of your device (the Espressif apps expects by default device name starting with "Prov_")
-const char *service_key = NULL;        // Password used for SofAP method (NULL = no password needed)
-bool reset_provisioned = false;        // When true the library will automatically delete previously provisioned data.
+// BLE Provisioning
+BLEServer *pServer = nullptr;
+BLEService *pProvService = nullptr;
+BLECharacteristic *pCredCharacteristic = nullptr;
+bool bleProvisioningActive = false;
+bool bleConnected = false;
+bool credentialsReceived = false;
+String wifiSSID = "";
+String wifiPassword = "";
+Preferences preferences;
+// Прототипы функций
+void setColor(uint8_t r, uint8_t g, uint8_t b);
+void setupI2S();
+void setupWiFi();
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
+bool detectSpeech(int16_t *samples, size_t sampleCount);
+void displayWeight(int weight);
+void eraseWiFiSettings();
+bool isWiFiProvisioned();
+void saveWiFiCredentials(const String &ssid, const String &password);
+void loadWiFiCredentials(String &ssid, String &password);
+void startBLEProvisioning();
+void stopBLEProvisioning();
+
+// BLE Callbacks
+class ServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *pServer)
+    {
+        bleConnected = true;
+        Serial.println("BLE Client Connected");
+        setColor(0, 0, 20); // Синий при подключении
+    };
+
+    void onDisconnect(BLEServer *pServer)
+    {
+        bleConnected = false;
+        Serial.println("BLE Client Disconnected");
+        if (!credentialsReceived)
+        {
+            setColor(20, 0, 0); // Красный при отключении до получения данных
+        }
+    }
+};
+
+class CredentialsCallback : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pCharacteristic)
+    {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0)
+        {
+            String data = String(value.c_str());
+            int separatorIndex = data.indexOf(':');
+            if (separatorIndex != -1)
+            {
+                wifiSSID = data.substring(0, separatorIndex);
+                wifiPassword = data.substring(separatorIndex + 1);
+
+                Serial.println("Received WiFi Credentials via BLE:");
+                Serial.println("SSID: " + wifiSSID);
+                Serial.println("Password: " + wifiPassword);
+
+                credentialsReceived = true;
+                setColor(0, 20, 0); // Зеленый при успешном получении
+            }
+        }
+    }
+};
 
 void setColor(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -74,89 +135,6 @@ void setColor(uint8_t r, uint8_t g, uint8_t b)
     analogWrite(BLUE_PIN, b);
 }
 
-// WARNING: SysProvEvent is called from a separate FreeRTOS task (thread)!
-void SysProvEvent(arduino_event_t *sys_event)
-{
-    switch (sys_event->event_id)
-    {
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        Serial.print("\nConnected IP address : ");
-        Serial.println(IPAddress(sys_event->event_info.got_ip.ip_info.ip.addr));
-        setColor(0, 0, 0);
-        break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-        Serial.println("\nDisconnected. Connecting to the AP again... ");
-        break;
-    case ARDUINO_EVENT_PROV_START:
-        Serial.println("\nProvisioning started\nGive Credentials of your access point using smartphone app");
-        break;
-    case ARDUINO_EVENT_PROV_CRED_RECV:
-    {
-        Serial.println("\nReceived Wi-Fi credentials");
-        Serial.print("\tSSID : ");
-        Serial.println((const char *)sys_event->event_info.prov_cred_recv.ssid);
-        Serial.print("\tPassword : ");
-        Serial.println((char const *)sys_event->event_info.prov_cred_recv.password);
-        break;
-    }
-    case ARDUINO_EVENT_PROV_CRED_FAIL:
-    {
-        Serial.println("\nProvisioning failed!\nPlease reset to factory and retry provisioning\n");
-        if (sys_event->event_info.prov_fail_reason == WIFI_PROV_STA_AUTH_ERROR)
-        {
-            Serial.println("\nWi-Fi AP password incorrect");
-        }
-        else
-        {
-            Serial.println("\nWi-Fi AP not found....Add API \" nvs_flash_erase() \" before beginProvision()");
-        }
-        break;
-    }
-    case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-        Serial.println("\nProvisioning Successful");
-        break;
-    case ARDUINO_EVENT_PROV_END:
-        Serial.println("\nProvisioning Ends");
-        break;
-    default:
-        break;
-    }
-}
-
-void eraseWiFiSettings()
-{
-    Serial.println("Erasing Wi-Fi credentials...");
-    WiFi.disconnect(true, true); // erase from flash
-    nvs_flash_erase();           // erase full NVS
-    nvs_flash_init();            // reinit NVS
-    delay(1000);
-    ESP.restart(); // restart device to apply changes
-}
-
-void displayWeight(int weight)
-{
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
-    display.setCursor(0, 50);
-    // Display static text
-    display.println("Вес:");
-    display.display();
-    display.setCursor(35, 50);
-    display.setTextSize(3);
-    display.print(weight);
-    display.print(" ");
-    display.print("g");
-    display.display();
-
-    // Проверка, если второй аргумент не пустой
-    display.setTextSize(2);
-    display.setCursor(0, 14); // Местоположение для второго текста
-    display.println(message);
-    display.display();
-}
-
-// Настройка I2S
 void setupI2S()
 {
     i2s_config_t i2s_config = {
@@ -180,22 +158,40 @@ void setupI2S()
     i2s_set_pin(I2S_NUM_0, &pin_config);
 }
 
-// WiFi
 void setupWiFi()
 {
-    // WiFi.begin(ssid, password);
-    WiFi.begin();
-    while (WiFi.status() != WL_CONNECTED)
+    String ssid, password;
+    loadWiFiCredentials(ssid, password);
+
+    if (ssid.length() > 0)
     {
-        delay(100);
-        Serial.print(".");
+        Serial.println("Connecting to saved WiFi: " + ssid);
+        WiFi.begin(ssid.c_str(), password.c_str());
+
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20)
+        {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            Serial.println("\nConnected to WiFi");
+            Serial.print("IP Address: ");
+            Serial.println(WiFi.localIP());
+            deviceID = WiFi.macAddress();
+            deviceID.replace(":", "");
+            setColor(0, 0, 0);
+            return;
+        }
     }
-    deviceID = WiFi.macAddress(); // например, "24:6F:28:A3:B2:10"
-    deviceID.replace(":", "");    // сделать ID компактнее: "246F28A3B210"
-    Serial.println("\nConnected to WiFi");
+
+    Serial.println("Failed to connect to saved WiFi. Starting provisioning...");
+    startBLEProvisioning();
 }
 
-// WebSocket
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
     switch (type)
@@ -206,26 +202,15 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     case WStype_DISCONNECTED:
         Serial.println("❌ Disconnected");
         allowReconnect = false;
-        // if (!allowReconnect) {
-        //     webSocket.setReconnectInterval(0);  // Отключаем авто-переподключение
-        // }
         break;
     case WStype_TEXT:
         if (payload != nullptr && length > 0)
         {
-            // Создаем строку из полезной части payload (без мусора после \0)
             message = String((const char *)payload).substring(0, length);
             Serial.print("📨 Message: ");
             Serial.println(message);
             displayWeight(scaleReading);
         }
-        else
-        {
-            Serial.println("📨 Empty or invalid message received");
-        }
-        break;
-    case WStype_BIN:
-        // Serial.printf("📨 Binary data received (%d bytes)\n", length);
         break;
     }
 }
@@ -237,9 +222,100 @@ bool detectSpeech(int16_t *samples, size_t sampleCount)
     {
         totalAmplitude += abs(samples[i]);
     }
-    int32_t averageAmplitude = totalAmplitude / sampleCount;
-    bool isdetected = averageAmplitude > VOX_THRESHOLD;
-    return isdetected;
+    return (totalAmplitude / sampleCount) > VOX_THRESHOLD;
+}
+
+void displayWeight(int weight)
+{
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 50);
+    display.println("Вес:");
+    display.display();
+    display.setCursor(35, 50);
+    display.setTextSize(3);
+    display.print(weight);
+    display.print(" g");
+    display.display();
+
+    display.setTextSize(2);
+    display.setCursor(0, 14);
+    display.println(message);
+    display.display();
+}
+
+void eraseWiFiSettings()
+{
+    Serial.println("Erasing Wi-Fi credentials...");
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
+    WiFi.disconnect(true);
+    delay(1000);
+    ESP.restart();
+}
+
+bool isWiFiProvisioned()
+{
+    preferences.begin("wifi", true);
+    bool provisioned = preferences.getString("ssid", "").length() > 0;
+    preferences.end();
+    return provisioned;
+}
+
+void saveWiFiCredentials(const String &ssid, const String &password)
+{
+    preferences.begin("wifi", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    preferences.end();
+    Serial.println("WiFi credentials saved");
+}
+
+void loadWiFiCredentials(String &ssid, String &password)
+{
+    preferences.begin("wifi", true);
+    ssid = preferences.getString("ssid", "");
+    password = preferences.getString("password", "");
+    preferences.end();
+}
+
+void startBLEProvisioning()
+{
+    Serial.println("Starting BLE Provisioning...");
+    bleProvisioningActive = true;
+    setColor(20, 0, 0); // Красный - ожидание данных
+
+    BLEDevice::init("ESP32-Provisioning");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    pProvService = pServer->createService(BLEUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b"));
+    pCredCharacteristic = pProvService->createCharacteristic(
+        BLEUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8"),
+        BLECharacteristic::PROPERTY_WRITE);
+    pCredCharacteristic->setCallbacks(new CredentialsCallback());
+    pProvService->start();
+
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(pProvService->getUUID());
+    pAdvertising->setScanResponse(true);
+    pAdvertising->start();
+
+    Serial.println("BLE Advertising Started");
+    Serial.println("Use BLE client to send credentials in format: SSID:Password");
+}
+
+void stopBLEProvisioning()
+{
+    if (bleProvisioningActive)
+    {
+        bleProvisioningActive = false;
+        BLEDevice::stopAdvertising();
+        BLEDevice::deinit();
+        Serial.println("BLE Provisioning Stopped");
+    }
 }
 
 void i2sTask(void *parameter)
@@ -254,42 +330,37 @@ void i2sTask(void *parameter)
     while (true)
     {
         i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
-        if (scaleChanged == true && scaleActivating == false)
+
+        if (scaleChanged && !scaleActivating)
         {
             scaleActivating = true;
-            // Не учитывать начальные шумы микрофона
             while (initDetect < 3)
             {
                 i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
                 if (!detectSpeech(samples, BUFFER_SIZE))
-                {
                     initDetect++;
-                }
             }
             setColor(0, 0, 20);
             initDetect = 0;
             lastVoiceTime = millis();
         }
+
         if (detectSpeech(samples, BUFFER_SIZE))
         {
             firstVoiceFlag = true;
             lastVoiceTime = millis();
             isSpeaking = true;
-            Serial.println("Speaking");
         }
         else if (millis() - lastVoiceTime > VOX_SILENCE_TIME)
         {
             isSpeaking = false;
-            Serial.println("Not speaking");
             if (firstVoiceFlag)
             {
                 firstVoiceFlag = false;
                 scaleActivating = false;
                 scaleChanged = false;
                 i2s_stop(I2S_NUM_0);
-                Serial.println("🛑 Остановлена запись.");
                 setColor(0, 0, 0);
-                continue;
             }
         }
         else if (abs(scaleReading) < 2)
@@ -298,26 +369,20 @@ void i2sTask(void *parameter)
             scaleActivating = false;
             scaleChanged = false;
             i2s_stop(I2S_NUM_0);
-            Serial.println("Весы пустые.");
             setColor(0, 0, 0);
-            continue;
         }
 
         if (isSpeaking)
         {
             setColor(0, 20, 0);
             int16_t *copy = (int16_t *)malloc(bytesRead);
-            if (copy != NULL)
+            if (copy)
             {
                 memcpy(copy, samples, bytesRead);
                 xQueueSend(audioQueue, &copy, portMAX_DELAY);
             }
-            else
-            {
-                Serial.println("❌ malloc failed");
-            }
         }
-        else
+        else if (scaleActivating)
         {
             setColor(0, 0, 20);
         }
@@ -333,37 +398,22 @@ void websocketTask(void *parameter)
     {
         if (webSocket.isConnected())
         {
-            if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500)) == pdTRUE)
-            {
+            if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500))) {
                 webSocket.sendBIN((uint8_t *)receivedSamples, BUFFER_SIZE * sizeof(int16_t));
                 free(receivedSamples);
                 eofSent = false;
             }
-            else
-            {
-                if (scaleChanged == false && !eofSent)
-                {
-
-                    String id = "{\"id\":\"" + deviceID + "\",\"weight\":" + String(savedScaleReading) + "}";
-                    webSocket.sendTXT(id);
-                    webSocket.sendTXT("{\"eof\" : 1}");
-
-                    delay(1000);
-                    eofSent = true;
-                    // webSocket.disconnect();
-                    // webSocket.setReconnectInterval(0);
-                    Serial.println("🛑 Отключение от WebSocket сервера.");
-                }
+            else if (!scaleChanged && !eofSent) {
+                String id = "{\"id\":\"" + deviceID + "\",\"weight\":" + String(savedScaleReading) + "}";
+                webSocket.sendTXT(id);
+                webSocket.sendTXT("{\"eof\" : 1}");
+                delay(1000);
+                eofSent = true;
             }
         }
     }
 }
 
-bool isWiFiProvisioned()
-{
-    return WiFi.getMode() != WIFI_MODE_NULL && WiFi.SSID().length() > 0;
-}
-// SETUP
 void setup()
 {
     Serial.begin(115200);
@@ -372,75 +422,53 @@ void setup()
     pinMode(GREEN_PIN, OUTPUT);
     pinMode(BLUE_PIN, OUTPUT);
     setColor(20, 0, 0);
-    btStop();                    // Отключить Bluetooth если был активен
-    esp_bt_controller_disable(); // Полное выключение контроллера BT
-    delay(500);
-    WiFi.onEvent(SysProvEvent);
-    delay(3000);
-    if (!isWiFiProvisioned())
+
+    // Инициализация NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        Serial.println("Device not provisioned. Starting BLE provisioning...");
-        uint8_t uuid[16] = {0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
-                            0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02};
-
-        WiFiProv.beginProvision(
-            WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BLE, WIFI_PROV_SECURITY_1, pop, service_name, service_key, uuid, reset_provisioned);
-        log_d("ble qr");
-        WiFiProv.printQR(service_name, pop, "ble");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
-    else
-    {
-        Serial.println("Already provisioned. Connecting to Wi-Fi...");
-        // WiFi.begin();
-        setupWiFi();
-    }
+    ESP_ERROR_CHECK(ret);
 
-    // setupWiFi();
-    webSocket.onEvent(webSocketEvent);
-    setupI2S();
-
+    // Инициализация дисплея
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
     {
         Serial.println(F("SSD1306 allocation failed"));
-        for (;;)
+        while (true)
             ;
     }
-
     display.setFont(&TimesNRCyr6pt8b);
     display.clearDisplay();
     display.setTextColor(WHITE);
+    displayWeight(0);
 
-    audioQueue = xQueueCreate(100, sizeof(int16_t *));
+    // Проверка и подключение WiFi
+    if (isWiFiProvisioned())
+    {
+        setupWiFi();
+    }
+    else
+    {
+        startBLEProvisioning();
+    }
 
-    Serial.println("Initializing the scale");
+    // Инициализация весов
     scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-    scale.set_scale(CALIBRATION_FACTOR); // this value is obtained by calibrating the scale with known weights; see the README for details
-    scale.tare();                        // reset the scale to 0
+    scale.set_scale(CALIBRATION_FACTOR);
+    scale.tare();
 
-    // Запуск задачи для чтения с I2S (ядро 1)
-    xTaskCreatePinnedToCore(
-        i2sTask,    // функция задачи
-        "I2S Task", // имя
-        8192,       // стек
-        NULL,       // аргумент (не используется)
-        1,          // приоритет
-        NULL,       // хендл (не используется)
-        0           // ядро (1 = APP)
-    );
+    // Настройка I2S и WebSocket
+    setupI2S();
+    webSocket.onEvent(webSocketEvent);
 
-    // Запуск задачи для отправки по WebSocket (ядро 0)
-    xTaskCreatePinnedToCore(
-        websocketTask,    // функция задачи
-        "WebSocket Task", // имя
-        8192,             // стек
-        NULL,             // аргумент (не используется)
-        1,                // приоритет
-        NULL,             // хендл (не используется)
-        1                 // ядро (0 = PRO)
-    );
+    // Создание очереди и задач
+    audioQueue = xQueueCreate(100, sizeof(int16_t *));
+    xTaskCreatePinnedToCore(i2sTask, "I2S Task", 8192, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(websocketTask, "WebSocket Task", 8192, NULL, 1, NULL, 1);
 
-    Serial.println("setup выполнен");
-    // setColor(0, 0, 0);
+    Serial.println("Setup complete");
 }
 
 void loop()
@@ -448,30 +476,64 @@ void loop()
     static bool lastButtonState = HIGH;
     buttonState = digitalRead(BUTTON_PIN);
 
+    // Обработка кнопки
     if (buttonState == LOW && lastButtonState == HIGH)
     {
-        Serial.print("tare...");
-        scale.tare();
         buttonPressStart = millis();
     }
-
-    if (buttonState == LOW)
+    else if (buttonState == LOW && millis() - buttonPressStart >= 5000)
     {
-        if (digitalRead(BUTTON_PIN) == LOW && millis() - buttonPressStart >= 5000)
+        eraseWiFiSettings();
+    }
+    else if (buttonState == HIGH && lastButtonState == LOW)
+    {
+        if (millis() - buttonPressStart < 5000)
         {
-            eraseWiFiSettings();
+            scale.tare();
+            Serial.println("Tare done");
+        }
+    }
+    lastButtonState = buttonState;
+
+    // Обработка BLE Provisioning
+    if (credentialsReceived)
+    {
+        Serial.println("Attempting WiFi connection with BLE credentials...");
+        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20)
+        {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            Serial.println("\nWiFi connected!");
+            saveWiFiCredentials(wifiSSID, wifiPassword);
+            deviceID = WiFi.macAddress();
+            deviceID.replace(":", "");
+            stopBLEProvisioning();
+            setColor(0, 0, 0);
+            credentialsReceived = false;
+        }
+        else
+        {
+            Serial.println("\nFailed to connect. Restarting BLE provisioning.");
+            credentialsReceived = false;
+            setColor(20, 0, 0);
+            delay(1000);
+            startBLEProvisioning();
         }
     }
 
-    if (allowReconnect)
-    {
-        webSocket.loop();
-    }
-
+    // Обновление показаний весов
     if (scale.wait_ready_timeout(200))
     {
         scaleReading = round(scale.get_units());
-        // убрать начальные шаги в граммах
+
         if (abs(scaleReading) < 2)
         {
             scaleReading = 0;
@@ -481,35 +543,37 @@ void loop()
         {
             display.ssd1306_command(SSD1306_DISPLAYON);
         }
+
         if (abs(scaleReading - scaleLastReading) > 1)
         {
             displayWeight(scaleReading);
             lastScaleTime = millis();
         }
+
         if (scaleLastReading < 2)
-        {
             savedScaleReading = 0;
-        }
         scaleLastReading = scaleReading;
     }
-    else
-    {
-        Serial.println("HX711 not found.");
-    }
 
-    if (scaleLastReading > 1 && scaleLastReading - savedScaleReading > 2 && millis() - lastScaleTime > SCALE_CHANGE_TIME)
+    // Активация передачи данных при изменении веса
+    if (scaleLastReading > 1 && scaleLastReading - savedScaleReading > 2 &&
+        millis() - lastScaleTime > SCALE_CHANGE_TIME)
     {
         savedScaleReading = scaleLastReading;
         allowReconnect = true;
         scaleChanged = true;
-        // webSocket.setReconnectInterval(5000);
+
         if (!webSocket.isConnected())
         {
             webSocket.begin(websocket_server, websocket_port);
-            Serial.println("🎙 Подключение к WebSocket серверу..");
+            Serial.println("Connecting to WebSocket server...");
         }
         i2s_start(I2S_NUM_0);
-        Serial.println("🎙 Начало записи...");
     }
-    lastButtonState = buttonState;
+
+    // Обработка WebSocket
+    if (allowReconnect)
+    {
+        webSocket.loop();
+    }
 }
