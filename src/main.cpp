@@ -37,7 +37,7 @@
 
 const char *websocket_server = "aazatserver.ru";
 const uint16_t websocket_port = 5000;
-const char *websocket_path = "/";
+const char *websocket_path = "/scale_server";
 
 WebSocketsClient webSocket;
 QueueHandle_t audioQueue;
@@ -46,13 +46,17 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Глобальные переменные
 unsigned long lastVoiceTime = 0;
+unsigned long lastDisplayTime = 0;
 bool isSpeaking = false;
 bool allowReconnect = false;
+bool eofSent = false;
 volatile bool buttonState = HIGH;
 unsigned long buttonPressStart = 0;
 int scaleReading;
-int scaleLastReading;
+int scaleLastReading = 0;
 int savedScaleReading = 0;
+int lastSendScale;
+
 unsigned long lastScaleTime = 0;
 volatile bool scaleChanged = false;
 String message = "";
@@ -210,6 +214,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
             Serial.print("📨 Message: ");
             Serial.println(message);
             displayWeight(scaleReading);
+            lastDisplayTime = millis();
+            setColor(0, 0, 0);
         }
         break;
     }
@@ -392,21 +398,24 @@ void i2sTask(void *parameter)
 void websocketTask(void *parameter)
 {
     int16_t *receivedSamples;
-    bool eofSent = false;
+    eofSent = false;
 
     while (true)
     {
         if (webSocket.isConnected())
         {
-            if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500))) {
+            if (xQueueReceive(audioQueue, &receivedSamples, pdMS_TO_TICKS(500)))
+            {
                 webSocket.sendBIN((uint8_t *)receivedSamples, BUFFER_SIZE * sizeof(int16_t));
                 free(receivedSamples);
                 eofSent = false;
             }
-            else if (!scaleChanged && !eofSent) {
-                String id = "{\"id\":\"" + deviceID + "\",\"weight\":" + String(savedScaleReading) + "}";
+            else if (!scaleChanged && !eofSent)
+            {
+                String id = "{\"id\":\"" + deviceID + "\",\"weight\":" + String(savedScaleReading - lastSendScale) + "}";
                 webSocket.sendTXT(id);
                 webSocket.sendTXT("{\"eof\" : 1}");
+                lastSendScale = savedScaleReading;
                 delay(1000);
                 eofSent = true;
             }
@@ -530,14 +539,15 @@ void loop()
     }
 
     // Обновление показаний весов
-    if (scale.wait_ready_timeout(200))
+    if (scale.wait_ready_timeout(5))
     {
-        scaleReading = round(scale.get_units());
+        scaleReading = round(scale.get_units(3));
 
-        if (abs(scaleReading) < 2)
+        if (abs(scaleReading) < 2 && millis() - lastDisplayTime >= 10000)
         {
             scaleReading = 0;
             display.ssd1306_command(SSD1306_DISPLAYOFF);
+            message = "";
         }
         else
         {
@@ -550,8 +560,11 @@ void loop()
             lastScaleTime = millis();
         }
 
-        if (scaleLastReading < 2)
+        if (scaleLastReading < 2 && eofSent)
+        {
+            lastSendScale = 0;
             savedScaleReading = 0;
+        }
         scaleLastReading = scaleReading;
     }
 
@@ -560,6 +573,7 @@ void loop()
         millis() - lastScaleTime > SCALE_CHANGE_TIME)
     {
         savedScaleReading = scaleLastReading;
+
         allowReconnect = true;
         scaleChanged = true;
 
